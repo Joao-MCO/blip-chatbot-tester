@@ -1,13 +1,17 @@
+import json
 import os
+import re
 import time
 from datetime import datetime
 
 from selenium.common.exceptions import WebDriverException
+from langchain_core.messages import HumanMessage
 
 from services.scrapping import browser
+from services.modelo_loader import carregar_imagens_modelo, localizar_arquivo_modelo
 
 from agent.state import State
-from agent.tools import decidir_resposta
+from agent.tools import carregar_instrucoes, decidir_resposta
 from agent.llm import llm
 
 MAX_TURNS = 25
@@ -36,17 +40,147 @@ def _dump_debug_html(turno: int, ultima_msg: str, opcoes: list):
         print(f"[debug] falha ao salvar HTML de diagnóstico: {e}")
 
 
-def _extrair_ultima_msg_bot(conversa):
-    """
-    Extrai a última mensagem do BOT (não do usuário) de uma lista de
-    mensagens retornada por browser.readMessages(). Ver comentário em
-    read_messages sobre por que não podemos usar conversa[-1] direto.
-    """
-    mensagens_bot = [m for m in conversa if m.get("role") == "bot"]
-    if not mensagens_bot:
-        return "", []
-    ultimo = mensagens_bot[-1]
-    return ultimo["content"], ultimo.get("options", [])
+def _mensagens_bot(conversa):
+    return [m for m in conversa if m.get("role") == "bot"]
+
+
+def _formatar_entrada_bot(mensagem: dict) -> str:
+    entrada = f"BOT: {mensagem.get('content', '')}"
+    opcoes = mensagem.get("options", []) or []
+    if opcoes:
+        entrada += "\nOPÇÕES DO BOT: " + json.dumps(opcoes, ensure_ascii=False)
+    return entrada
+
+
+def _padrao_com_placeholders(texto: str) -> str:
+    partes = re.split(r"(\{[^{}]+\})", texto)
+    regex = []
+    for parte in partes:
+        if re.fullmatch(r"\{[^{}]+\}", parte or ""):
+            regex.append(r".+?")
+        else:
+            regex.append(re.escape(parte))
+    return "^" + "".join(regex) + "$"
+
+
+def _eh_template_variavel(esperado: str, ocorreu: str) -> bool:
+    if "{" not in esperado or "}" not in esperado:
+        return False
+    padrao = _padrao_com_placeholders(esperado)
+    return re.fullmatch(padrao, ocorreu, flags=re.DOTALL) is not None
+
+
+def _eh_mensagem_agrupada(
+    esperado: str,
+    ocorreu: str,
+    conversa_estruturada: list[dict] | None,
+) -> bool:
+    if not conversa_estruturada:
+        return False
+
+    esperado_normalizado = re.sub(r"\s+", " ", esperado).strip()
+    ocorreu_normalizado = re.sub(r"\s+", " ", ocorreu).strip()
+
+    for cenario in conversa_estruturada:
+        bots = [m["texto"] for m in cenario.get("mensagens", []) if m.get("role") == "bot"]
+        for indice in range(len(bots) - 1):
+            combinado = f"{bots[indice]}\n{bots[indice + 1]}"
+            combinado_normalizado = re.sub(r"\s+", " ", combinado).strip()
+            if combinado_normalizado == esperado_normalizado and bots[indice] == ocorreu_normalizado:
+                return True
+
+    return False
+
+
+def _mensagens_por_cenario(mensagens: list[str]) -> list[dict]:
+    cenarios = []
+    atual = {"cenario": 1, "mensagens": []}
+    ordem_global = 1
+
+    for entrada in mensagens:
+        if entrada.startswith("SYSTEM: conversa reiniciada intencionalmente pelo roteiro de teste."):
+            if atual["mensagens"]:
+                cenarios.append(atual)
+                atual = {"cenario": atual["cenario"] + 1, "mensagens": []}
+            continue
+
+        if entrada.startswith("BOT: "):
+            corpo = entrada[len("BOT: ") :]
+            opcoes = []
+            if "\nOPÇÕES DO BOT: " in corpo:
+                corpo, opcoes_json = corpo.split("\nOPÇÕES DO BOT: ", 1)
+                try:
+                    opcoes = json.loads(opcoes_json)
+                except json.JSONDecodeError:
+                    opcoes = [opcoes_json]
+            atual["mensagens"].append(
+                {
+                    "ordem_global": ordem_global,
+                    "role": "bot",
+                    "texto": corpo,
+                    "opcoes": opcoes,
+                }
+            )
+            ordem_global += 1
+            continue
+
+        if entrada.startswith("USER: "):
+            atual["mensagens"].append(
+                {
+                    "ordem_global": ordem_global,
+                    "role": "user",
+                    "texto": entrada[len("USER: ") :],
+                }
+            )
+            ordem_global += 1
+            continue
+
+    if atual["mensagens"]:
+        cenarios.append(atual)
+
+    for cenario in cenarios:
+        cenario["total_mensagens"] = len(cenario["mensagens"])
+
+    return cenarios
+
+
+def _roteiro_por_cenario(tasks: list[dict]) -> list[dict]:
+    cenarios = []
+    atual = {"cenario": 1, "tarefas": []}
+    ordem_global = 1
+
+    for tarefa in tasks:
+        if tarefa.get("type") == "restart":
+            atual["tarefas"].append(
+                {
+                    "ordem_global": ordem_global,
+                    "type": tarefa.get("type"),
+                    "instruction": tarefa.get("instruction"),
+                }
+            )
+            ordem_global += 1
+            cenarios.append(atual)
+            atual = {"cenario": atual["cenario"] + 1, "tarefas": []}
+            continue
+
+        atual["tarefas"].append(
+            {
+                "ordem_global": ordem_global,
+                "type": tarefa.get("type"),
+                "instruction": tarefa.get("instruction"),
+                "value": tarefa.get("value"),
+                "field": tarefa.get("field"),
+            }
+        )
+        ordem_global += 1
+
+    if atual["tarefas"]:
+        cenarios.append(atual)
+
+    for cenario in cenarios:
+        cenario["total_tarefas"] = len(cenario["tarefas"])
+
+    return cenarios
 
 
 # IMPORTANTE -- padrão de retorno dos nós:
@@ -66,26 +200,31 @@ def _extrair_ultima_msg_bot(conversa):
 
 
 def read_messages(state: State) -> dict:
-
     mensagem_anterior = state.get("current_message", "")
+    bot_seen_anterior = state.get("bot_messages_seen", 0)
 
-    # Camada extra de segurança: se a primeira leitura vier igual à
-    # mensagem anterior (ou seja, aparentemente "nada mudou"), tentamos
-    # ler de novo mais 2 vezes com um pequeno intervalo antes de aceitar
-    # isso como uma repetição real do bot. Isso cobre casos em que o
-    # Selenium capturou o DOM num instante intermediário (ex: bolha
-    # ainda vazia, texto sendo preenchido, opções ainda não anexadas) --
-    # mesmo com as esperas em waitForNewMessage, timing de UI nunca é
-    # 100% determinístico.
+    # Guardamos quantas bolhas do bot já foram consumidas porque o DOM
+    # pode acumular várias mensagens no mesmo turno. Ler só a última
+    # bolha fazia o histórico perder trechos intermediários.
     try:
         conversa = browser.readMessages()
-        ultima_msg, ultimas_opcoes = _extrair_ultima_msg_bot(conversa)
+        mensagens_bot = _mensagens_bot(conversa)
 
+        if len(mensagens_bot) < bot_seen_anterior:
+            bot_seen_anterior = 0
+
+        novas_mensagens_bot = mensagens_bot[bot_seen_anterior:]
         tentativas_extra = 0
-        while ultima_msg == mensagem_anterior and tentativas_extra < 2:
+
+        while not novas_mensagens_bot and mensagem_anterior and tentativas_extra < 2:
             time.sleep(1.5)
             conversa = browser.readMessages()
-            ultima_msg, ultimas_opcoes = _extrair_ultima_msg_bot(conversa)
+            mensagens_bot = _mensagens_bot(conversa)
+
+            if len(mensagens_bot) < bot_seen_anterior:
+                bot_seen_anterior = 0
+
+            novas_mensagens_bot = mensagens_bot[bot_seen_anterior:]
             tentativas_extra += 1
     except WebDriverException as e:
         # Falha de conexão com o ChromeDriver/Chrome (ex: processo
@@ -96,70 +235,48 @@ def read_messages(state: State) -> dict:
         print(f"[read_messages] falha de conexão com o navegador: {e}")
         return {"error": True, "end": True, "messages": []}
 
-    mensagem_mudou = ultima_msg != mensagem_anterior
+    if mensagens_bot:
+        ultima = mensagens_bot[-1]
+        ultima_msg = ultima["content"]
+        ultimas_opcoes = ultima.get("options", [])
+    else:
+        ultima_msg = ""
+        ultimas_opcoes = []
 
-    # detecta se o bot repetiu a mesma mensagem da rodada anterior
-    # (indício de que o agente está preso em loop) -- só conta como
-    # repetição de verdade depois das tentativas extras acima
-    repeated_count = (state.get("repeated_count", 0) + 1) if (ultima_msg and not mensagem_mudou) else 0
+    mensagem_mudou = bool(novas_mensagens_bot)
+    repeated_count = (
+        state.get("repeated_count", 0) + 1
+        if (ultima_msg and not mensagem_mudou and ultima_msg == mensagem_anterior)
+        else 0
+    )
 
-    # SALVAGUARDA ESTRUTURAL: se essa mesma mensagem do bot já apareceu
-    # ANTES no histórico da conversa (não apenas na rodada imediatamente
-    # anterior, mas em qualquer ponto anterior), é sinal de que o bot
-    # reiniciou o fluxo do zero -- isso só acontece depois de uma
-    # despedida/encerramento, então força o fim do teste aqui, sem
-    # depender exclusivamente do LLM classificar corretamente a
-    # despedida anterior como "fim" (o LLM pode "esquecer" de encerrar
-    # quando ainda há itens do roteiro pendentes, por exemplo).
     historico_bot_anterior = [
         m[len("BOT: "):] for m in state.get("messages", []) if m.startswith("BOT: ")
     ]
-    if ultima_msg and ultima_msg in historico_bot_anterior:
-        print(
-            f"[read_messages] mensagem do bot já vista antes no histórico "
-            f"({ultima_msg!r}) -- fluxo reiniciou, encerrando o teste"
-        )
-        return {
-            "current_message": ultima_msg,
-            "current_options": ultimas_opcoes,
-            "end": True,
-            "repeated_count": repeated_count,
-            "messages": [],
-        }
 
-    # Diagnóstico: salva o HTML completo + o que foi extraído a cada
-    # leitura. Útil para investigar casos em que uma mensagem tinha
-    # opções de menu mas o agente não as identificou.
-    _dump_debug_html(state.get("turns", 0), ultima_msg, ultimas_opcoes)
+    print("Última:", ultima_msg)
+    print("Histórico:", historico_bot_anterior[-5:])
 
     print(
         f"[read_messages] turno={state.get('turns', 0)} "
-        f"msg={ultima_msg!r} opcoes={ultimas_opcoes!r}"
+        f"msg={ultima_msg!r} opcoes={ultimas_opcoes!r} "
+        f"novas={len(novas_mensagens_bot)}"
     )
 
-    # Só registramos a mensagem do bot no histórico se ela for
-    # realmente nova. "messages" usa um reducer que sempre concatena
-    # (o dict retornado por este nó é somado ao histórico existente,
-    # não o substitui) -- sem essa checagem, a mesma mensagem do bot
-    # seria duplicada no histórico a cada volta do grafo, mesmo quando
-    # ele não disse nada novo (ex: enquanto aguardamos uma resposta).
-    #
-    # Camada extra: mesmo com "mensagem_mudou" checado acima, garantimos
-    # aqui que a entrada a ser adicionada não seja idêntica à última já
-    # registrada no histórico -- proteção redundante contra duplicação,
-    # já que o histórico só deve crescer quando algo novo é de fato
-    # trocado com o bot.
     historico_atual = state.get("messages", [])
-    nova_entrada = f"BOT: {ultima_msg}"
+    novas_mensagens = []
+    ultima_entrada_registrada = historico_atual[-1] if historico_atual else None
 
-    if mensagem_mudou and (not historico_atual or historico_atual[-1] != nova_entrada):
-        novas_mensagens = [nova_entrada]
-    else:
-        novas_mensagens = []
+    for mensagem in novas_mensagens_bot:
+        nova_entrada = _formatar_entrada_bot(mensagem)
+        if nova_entrada != ultima_entrada_registrada:
+            novas_mensagens.append(nova_entrada)
+            ultima_entrada_registrada = nova_entrada
 
     return {
         "current_message": ultima_msg,
         "current_options": ultimas_opcoes,
+        "bot_messages_seen": bot_seen_anterior + len(novas_mensagens_bot),
         "repeated_count": repeated_count,
         "messages": novas_mensagens,
     }
@@ -176,10 +293,15 @@ def generate_response(state: State) -> dict:
     # uma checagem antiga baseada em palavras-chave fixas (ex:
     # "obrigado pelo contato"), que não cobria a forma real como os
     # bots se despedem (ex: "Muito Obrigado! Volte sempre!").
+    task = None
+
+    task = current_task(state)
+
     resultado = decidir_resposta(
-        messages=state.get("messages", []),
+        messages=state["messages"],
         mensagem_atual=state["current_message"],
-        opcoes=state.get("current_options") or None,
+        task=task,
+        opcoes=state["current_options"],
     )
 
     response_tipo = resultado["tipo"]
@@ -204,11 +326,37 @@ def send_message(state: State) -> dict:
     resposta = state["response"]
 
     if tipo == "fim":
-        # o LLM identificou que o bot encerrou o atendimento (despedida,
-        # protocolo, agradecimento final etc). Não enviamos mais nada --
-        # só marcamos o fim para should_finish encerrar o teste.
-        print(f"[send_message] turno={state.get('turns', 0)} fim de conversa detectado")
-        return {"end": True, "messages": []}
+
+        task = current_task(state)
+
+        if task and task.get("type") == "restart":
+            browser.restartConversation()
+
+            return {
+                "messages": [
+                    "SYSTEM: conversa reiniciada intencionalmente pelo roteiro de teste."
+                ],
+                "turns": 0,
+                "current_message": "",
+                "current_options": [],
+                "repeated_count": 0,
+                "aguardar_count": 0,
+                "current_task": next_task(state),
+            }
+
+        # Uma despedida só conclui o teste quando o roteiro também acabou.
+        # Se ainda existe uma ação comum pendente, mantemos o diagnóstico
+        # explícito em vez de declarar sucesso prematuramente.
+        if task:
+            print(
+                "[send_message] bot encerrou a conversa com tarefas pendentes: "
+                f"{task.get('instruction', task)!r}"
+            )
+        _dump_debug_html(state.get("turns", 0), state["current_message"], state["current_options"])
+
+        return {
+            "end": True
+        }
 
     if tipo == "aguardar":
         # o bot mandou algo que não espera resposta do usuário (ex: um
@@ -252,15 +400,11 @@ def send_message(state: State) -> dict:
 
     turns = state.get("turns", 0) + 1
 
-    print(
-        f"[send_message] turno={turns} msg={resposta!r} "
-        f"via_clique={enviado_via_clique}"
-    )
-
     return {
         "aguardar_count": 0,
         "messages": novas_mensagens,
         "turns": turns,
+        "current_task": next_task(state),
     }
 
 
@@ -311,21 +455,302 @@ def generate_summary(state: State) -> dict:
             "sem sucesso (possível travamento do lado do bot)"
         )
 
-    prompt = f"""
-Analise a conversa abaixo, que é um teste automatizado de um chatbot.
+    caminho_modelo = localizar_arquivo_modelo()
 
-Motivo do encerramento do teste: {motivo_encerramento}
+    if caminho_modelo is not None:
+        resposta_content = _gerar_comparativo_com_modelo(
+            state.get("messages", []),
+            motivo_encerramento,
+            caminho_modelo,
+            state.get("tasks", []),
+            state.get("conversation_origin", "Origem não informada."),
+        )
+    else:
+        resposta_content = _gerar_resumo_padrao(conversa, motivo_encerramento)
+
+    return {"summary": resposta_content}
+
+
+def _gerar_resumo_padrao(conversa: str, motivo_encerramento: str) -> str:
+    """
+    Comportamento padrão (sem arquivo "modelo" configurado): gera um
+    resumo textual da conversa, possíveis falhas e melhorias.
+    """
+    prompt = f"""
+Analise a conversa abaixo, que é um teste automatizado de chatbot.
+
+Motivo técnico do encerramento: {motivo_encerramento}
 
 Conversa:
 {conversa}
 
-Retorne:
+Retorne SOMENTE erros concretos observados na conversa.
 
-1. Resumo
-2. Possíveis falhas
-3. Melhorias
+Formato de cada item:
+**Erro N — título curto**
+- Esperado: comportamento correto.
+- Ocorreu: mensagem ou comportamento observado.
+- Problema: explicação simples de por que está errado.
+
+Regras:
+- Não escreva resumo, conclusão, acertos, melhorias ou despedida.
+- Não invente erros. Se não houver erro comprovável, responda apenas:
+  "Nenhum erro identificado."
+- Use poucas palavras e cite apenas o trecho necessário.
 """
 
     resposta = llm.invoke(prompt)
+    return resposta.content
 
-    return {"summary": resposta.content}
+
+def _gerar_comparativo_com_modelo(
+    mensagens: list[str],
+    motivo_encerramento: str,
+    caminho_modelo: str,
+    tasks: list[dict],
+    conversation_origin: str,
+) -> str:
+    """
+    Gera um comparativo entre o fluxo esperado (arquivo "modelo" --
+    imagem ou PDF exportado do Figma, com o design/fluxo de mensagens
+    planejado) e o que o chatbot realmente respondeu durante o teste.
+
+    Em vez de tentar extrair o texto do design via processamento de
+    PDF (frágil e impreciso, já que o Figma mistura balões de mensagem
+    com rótulos do fluxograma no layout), enviamos a própria imagem do
+    modelo para a LLM multimodal -- ela lê o design diretamente e
+    compara com o texto real da conversa capturada pelo Selenium.
+    """
+    imagens_base64 = carregar_imagens_modelo()
+
+    if not imagens_base64:
+        # o arquivo existe mas não foi possível carregá-lo (erro de
+        # conversão, formato inválido etc.) -- cai para o resumo padrão
+        # em vez de falhar o teste inteiro por causa disso
+        print(
+            f"[generate_summary] arquivo de modelo encontrado em "
+            f"{caminho_modelo!r} mas não foi possível carregá-lo; "
+            f"gerando resumo padrão"
+        )
+        return _gerar_resumo_padrao(conversa, motivo_encerramento)
+
+    nome_arquivo = os.path.basename(caminho_modelo)
+
+    roteiro_teste = carregar_instrucoes()
+    conversa_estruturada = _mensagens_por_cenario(mensagens)
+    conversa_segmentada = json.dumps(
+        conversa_estruturada,
+        ensure_ascii=False,
+        indent=2,
+    )
+    roteiro_segmentado = json.dumps(
+        _roteiro_por_cenario(tasks),
+        ensure_ascii=False,
+        indent=2,
+    )
+
+    texto_instrucao = f"""
+Você está validando uma conversa de chatbot em um teste automatizado.
+
+Origem da conversa capturada:
+{conversation_origin}
+
+Origem do fluxo esperado:
+Arquivo "{nome_arquivo}" exportado do Figma.
+
+A tarefa é comparar o que foi esperado com o que realmente aconteceu,
+sem assumir contexto específico do domínio.
+
+Abaixo está a conversa REAL capturada durante o teste.
+Ela está separada por cenário e em JSON para reduzir mistura entre
+ramificações.
+
+--- CONVERSA REAL ESTRUTURADA ---
+{conversa_segmentada}
+--- FIM DA CONVERSA REAL ---
+
+--- ROTEIRO EXECUTADO ESTRUTURADO ---
+{roteiro_segmentado}
+--- FIM DO ROTEIRO ---
+
+--- ROTEIRO ORIGINAL ---
+{roteiro_teste or "Nenhum roteiro específico."}
+--- FIM DO ROTEIRO ORIGINAL ---
+
+Motivo do encerramento do teste: {motivo_encerramento}
+
+Compare a conversa com o conteúdo VISÍVEL nas imagens e retorne SOMENTE
+JSON válido, sem markdown, neste formato:
+
+{{
+  "erros": [
+    {{
+      "titulo": "título curto",
+      "esperado_no_modelo": "transcrição literal do modelo",
+      "ocorreu": "transcrição literal da mensagem/opções do bot",
+      "problema": "explicação curta e didática"
+    }}
+  ]
+}}
+
+Regras obrigatórias:
+- Não retorne resumo, conclusão, mensagens que batem, acertos,
+  recomendações, prioridades ou despedida.
+- Use poucas palavras. Não repita o mesmo erro em itens diferentes.
+- Cada erro precisa conter evidência literal nos campos
+  "esperado_no_modelo" e "ocorreu". Não use descrições vagas.
+- Se esperado e ocorrido forem iguais, isso NÃO é erro e o item deve ser
+  omitido. A escolha feita pelo USER também nunca prova que as opções do
+  BOT estavam erradas; use apenas "OPÇÕES DO BOT" como evidência.
+- A imagem é a única fonte do fluxo esperado. Não atribua ao modelo
+  nenhuma mensagem que não esteja claramente visível nele.
+- Compare cenário por cenário. Não misture opções, textos ou emojis de
+  um cenário com outro.
+- Use `ordem_global`, `total_mensagens` e `total_tarefas` para conferir
+  sequência e cobertura total do fluxo.
+- Se uma mensagem não tiver `opcoes` no JSON da conversa, não invente
+  opções para ela.
+- Cada item da conversa representa uma única bolha do bot. Não junte
+  uma mensagem com a seguinte na mesma comparação.
+- Texto entre chaves é variável de template. Se o
+  restante da frase bate, isso não é erro.
+- Use o `ROTEIRO EXECUTADO ESTRUTURADO` apenas como guia de ordem e
+  intenção do teste. Nunca transfira opções, textos ou requisitos de um
+  cenário para outro.
+- Verifique sempre a fraseologia completa. Isso inclui ordem das
+  palavras, pontuação, espaços, quebras de linha, acentos, caracteres
+  especiais, emojis, negrito, itálico e qualquer outra marcação visível.
+- Verifique a ordem completa da conversa. Se uma mensagem faltou,
+  sobrou, foi duplicada, ou apareceu fora de posição, isso é erro.
+- Verifique também a cobertura total do fluxo. Se uma mensagem esperada
+  não foi enviada, ou se o bot enviou uma mensagem extra, registre.
+- Compare também todas as opções/botões visíveis, não apenas a pergunta.
+  Liste opções ausentes, extras ou com texto diferente, inclusive na
+  ordem em que aparecem.
+- Se houver negrito, itálico, sublinhado, aspas, parênteses, quebras de
+  linha ou qualquer outro destaque visível, trate isso como parte do
+  texto comparado.
+- Compare emojis como parte do texto. Emoji ausente, extra ou diferente
+  é uma divergência e deve ser indicado com precisão.
+- Ao citar uma mensagem, leia o bloco inteiro no modelo; não resuma nem
+  chame de "incompleto" sem mostrar qual trecho ou emoji está diferente.
+- Diferencie mensagem ausente de caminho não percorrido. Só marque uma
+  mensagem como ausente se a conversa realmente entrou naquele ramo.
+- O roteiro explica as ações intencionais do testador. Não classifique
+  reinícios solicitados pelo roteiro, nem mensagens enviadas pelo
+  testador, como erro do chatbot.
+- Cada bloco "CENÁRIO" é independente. Não interprete a abertura do
+  cenário seguinte como continuação espontânea do anterior.
+- Ignore diferenças apenas visuais causadas pela captura textual de
+  botões, menus e outros componentes visuais.
+- Se não houver erro comprovável, retorne {{"erros": []}}.
+  """
+
+    conteudo_mensagem = [{"type": "text", "text": texto_instrucao}]
+
+    for img_b64 in imagens_base64:
+        conteudo_mensagem.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{img_b64}"},
+            }
+        )
+
+    mensagem = HumanMessage(content=conteudo_mensagem)
+
+    try:
+        resposta = llm.invoke([mensagem])
+    except Exception as e:
+        print(f"[generate_summary] falha ao chamar o modelo multimodal: {e}")
+        print("[generate_summary] gerando resumo padrão como fallback")
+        return _gerar_resumo_padrao(conversa, motivo_encerramento)
+
+    return _formatar_erros(resposta.content, conversa_estruturada)
+
+
+def _segmentar_cenarios(conversa: str) -> str:
+    marcador = "SYSTEM: conversa reiniciada intencionalmente pelo roteiro de teste."
+    partes = conversa.split(marcador)
+    blocos = []
+
+    for indice, parte in enumerate(partes, start=1):
+        conteudo = parte.strip()
+        if conteudo:
+            blocos.append(f"=== CENÁRIO {indice} ===\n{conteudo}")
+
+    return "\n\n".join(blocos)
+
+
+def _formatar_erros(
+    conteudo: str,
+    conversa_estruturada: list[dict] | None = None,
+) -> str:
+    """Valida o JSON do modelo e produz um relatório curto e consistente."""
+    bruto = conteudo.strip()
+    if bruto.startswith("```"):
+        bruto = bruto.strip("`").strip()
+        if bruto.lower().startswith("json"):
+            bruto = bruto[4:].strip()
+
+    try:
+        dados = json.loads(bruto)
+    except (json.JSONDecodeError, TypeError):
+        return "Falha ao validar a análise: o modelo não retornou JSON válido."
+
+    erros = dados.get("erros", []) if isinstance(dados, dict) else []
+    itens = []
+    vistos = set()
+
+    for erro in erros:
+        if not isinstance(erro, dict):
+            continue
+
+        titulo = str(erro.get("titulo", "")).strip()
+        esperado = str(erro.get("esperado_no_modelo", "")).strip()
+        ocorreu = str(erro.get("ocorreu", "")).strip()
+        problema = str(erro.get("problema", "")).strip()
+
+        # Itens sem evidência ou que comparam textos idênticos são falsos
+        # positivos e não entram no relatório final.
+        if not all((titulo, esperado, ocorreu, problema)):
+            continue
+        if esperado.casefold() == ocorreu.casefold():
+            continue
+        if _eh_template_variavel(esperado, ocorreu):
+            continue
+        if _eh_mensagem_agrupada(esperado, ocorreu, conversa_estruturada):
+            continue
+
+        chave = (esperado.casefold(), ocorreu.casefold())
+        if chave in vistos:
+            continue
+        vistos.add(chave)
+
+        numero = len(itens) + 1
+        itens.append(
+            f"**Erro {numero} — {titulo}**\n"
+            f"- Esperado no modelo: {esperado}\n"
+            f"- Ocorreu: {ocorreu}\n"
+            f"- Problema: {problema}"
+        )
+
+    return "\n\n".join(itens) if itens else "Nenhum erro identificado."
+
+def current_task(state):
+    indice = state.get("current_task", 0)
+
+    if indice >= len(state["tasks"]):
+        return None
+
+    return state["tasks"][indice]
+
+
+def next_task(state):
+    task = current_task(state)
+
+    indice = state["current_task"]
+
+    if task and task.get("advance_on_response", False):
+        indice += 1
+
+    return indice

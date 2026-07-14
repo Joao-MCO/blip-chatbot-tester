@@ -211,3 +211,4 @@ secrets.toml
 /dados
 debug_html/
 instrucoes.txt
+modelo.*

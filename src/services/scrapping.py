@@ -21,7 +21,10 @@ from selenium.webdriver.support import expected_conditions as EC
 
 BUBBLE_SELECTOR = ".bubble.left, .bubble.right"
 
-OPTIONS_CONTAINER_SELECTOR = ".slideshow-track.options ul.item-list li"
+OPTIONS_CONTAINER_SELECTOR = (
+    ".slideshow-track.options ul.item-list li, "
+    ".slideshow-container .fixed-options ul.item-list li"
+)
 
 
 class Browser:
@@ -141,7 +144,10 @@ class Browser:
         except TimeoutException:
             return False
 
-        self._wait_for_dom_stable(timeout=4)
+        # Uma resposta do bot pode ser composta por várias bolhas em
+        # sequência (ex.: texto de pesar e, depois, pergunta com opções).
+        # Só liberamos o agente após um período contínuo sem mudanças.
+        self._wait_for_dom_stable(timeout=6, stable_for=1.5)
 
         try:
             self._wait_for(
@@ -155,7 +161,12 @@ class Browser:
 
         return True
 
-    def _wait_for_dom_stable(self, timeout: int = 3, poll: float = 0.3):
+    def _wait_for_dom_stable(
+        self,
+        timeout: int = 6,
+        poll: float = 0.25,
+        stable_for: float = 1.5,
+    ):
         """
         Aguarda ate que o tamanho do HTML da pagina pare de mudar entre
         duas leituras seguidas (ou ate estourar o timeout). Usado para
@@ -165,24 +176,34 @@ class Browser:
         import time
 
         deadline = time.monotonic() + timeout
-        last_len = None
+        last_snapshot = None
+        stable_since = None
 
         while time.monotonic() < deadline:
             try:
-                current_len = len(self.__browser.page_source)
+                # Comprimento + quantidade de bolhas detectam tanto novas
+                # mensagens quanto opções anexadas a uma bolha existente.
+                snapshot = (
+                    len(self.__browser.page_source),
+                    self._count_bubbles(),
+                )
             except Exception:
                 return
 
-            if last_len is not None and current_len == last_len:
+            agora = time.monotonic()
+
+            if snapshot != last_snapshot:
+                last_snapshot = snapshot
+                stable_since = agora
+            elif stable_since is not None and agora - stable_since >= stable_for:
                 return
 
-            last_len = current_len
             time.sleep(poll)
 
     # ------------------------------------------------------------------
     # Envio de mensagens
     # ------------------------------------------------------------------
-    def sendMessage(self, msg: str, wait_response: bool = False, timeout: int = 15):
+    def sendMessage(self, msg: str, wait_response: bool = True, timeout: int = 15):
         """
         Digita e envia uma mensagem de texto livre pelo textarea.
         Se wait_response=True, aguarda até uma nova bolha aparecer
@@ -198,53 +219,145 @@ class Browser:
         if wait_response:
             self.waitForNewMessage(previous_count, timeout=timeout)
 
-    def selectOption(self, option_text: str, wait_response: bool = True, timeout: int = 15) -> bool:
+    def selectOption(
+        self,
+        option_text: str,
+        wait_response: bool = True,
+        timeout: int = 15,
+    ) -> bool:
         """
-        Clica em uma opção/botão de menu (elemento <li> do Blip) cujo
-        texto bate com option_text. Isso é necessário porque, em menus
-        de opções (select/quick-reply), o Blip espera o clique no
-        elemento -- apenas digitar o texto no textarea pode não ser
-        reconhecido como uma escolha válida pelo fluxo do bot.
+        Clica em uma opção pertencente à ÚLTIMA mensagem do bot.
 
-        Retorna True se conseguiu clicar em alguma opção.
+        Isso evita clicar em botões antigos ("Sim", "Não", etc.) que ainda
+        permanecem no DOM de conversas anteriores.
         """
         previous_count = self._count_bubbles()
 
-        options = self.__browser.find_elements(By.CSS_SELECTOR, OPTIONS_CONTAINER_SELECTOR)
+        # Última bolha do bot
+        try:
+            bot_bubbles = self.__browser.find_elements(By.CSS_SELECTOR, ".bubble.left")
+
+            if not bot_bubbles:
+                return False
+
+            ultima_bolha = bot_bubbles[-1]
+
+        except WebDriverException:
+            return False
+
+        # Procura o container de opções associado apenas a essa bolha
+        candidatos_xpath = [
+            "./ancestor::div[contains(@class, 'blip-relative')][1]",
+            "./ancestor::*[contains(@class,'left') or contains(@class,'right')]"
+            "[.//div[contains(@class,'slideshow-track') and contains(@class,'options')]][1]",
+            "./ancestor::div[position()<=6][.//div[contains(@class,'slideshow-track')]][1]",
+        ]
+
+        option_elements = []
+
+        for xpath in candidatos_xpath:
+            try:
+                container = ultima_bolha.find_element(By.XPATH, xpath)
+
+                encontrados = container.find_elements(
+                    By.CSS_SELECTOR,
+                    OPTIONS_CONTAINER_SELECTOR,
+                )
+
+                if encontrados:
+                    option_elements = encontrados
+                    break
+
+            except (
+                NoSuchElementException,
+                StaleElementReferenceException,
+            ):
+                continue
+
+        if not option_elements:
+            print("[selectOption] Nenhuma opção encontrada para a última mensagem.")
+            return False
 
         alvo = None
-        for opt in options:
+        texto_procurado = option_text.strip().lower()
+
+        # Correspondência exata
+        for opt in option_elements:
             try:
                 texto = opt.text.strip()
-            except StaleElementReferenceException:
-                continue
-            if texto == option_text.strip():
-                alvo = opt
-                break
 
-        if alvo is None:
-            for opt in options:
-                try:
-                    texto = opt.text.strip().lower()
-                except StaleElementReferenceException:
-                    continue
-                if option_text.strip().lower() in texto:
+                if texto.lower() == texto_procurado:
                     alvo = opt
                     break
 
+            except StaleElementReferenceException:
+                continue
+
+        # Correspondência parcial
         if alvo is None:
+            for opt in option_elements:
+                try:
+                    texto = opt.text.strip().lower()
+
+                    if texto_procurado in texto:
+                        alvo = opt
+                        break
+
+                except StaleElementReferenceException:
+                    continue
+
+        if alvo is None:
+            print(
+                f"[selectOption] Opção '{option_text}' não encontrada."
+            )
+
+            print(
+                "[selectOption] Opções disponíveis:",
+                [o.text for o in option_elements],
+            )
+
             return False
 
         try:
-            self.__browser.execute_script("arguments[0].scrollIntoView({block: 'center'});", alvo)
-            alvo.click()
-        except ElementClickInterceptedException:
-            self.__browser.execute_script("arguments[0].click();", alvo)
+            self.__browser.execute_script(
+                "arguments[0].scrollIntoView({block:'center'});",
+                alvo,
+            )
+
+            WebDriverWait(self.__browser, 5).until(
+                EC.element_to_be_clickable(alvo)
+            )
+
+            try:
+                alvo.click()
+            except (
+                ElementClickInterceptedException,
+                WebDriverException,
+            ):
+                self.__browser.execute_script(
+                    "arguments[0].click();",
+                    alvo,
+                )
+
         except StaleElementReferenceException:
             return False
+        
 
         if wait_response:
-            self.waitForNewMessage(previous_count, timeout=timeout)
+            inicio = time.time()
+
+            chegou = self.waitForNewMessage(previous_count, timeout=timeout)
+
+            print(
+                f"[selectOption] waitForNewMessage={chegou} "
+                f"({time.time() - inicio:.2f}s)"
+            )
+
+            if not chegou:
+                print(
+                    "[selectOption] Nenhuma nova mensagem recebida após o clique."
+                )
+                return False
 
         return True
 
@@ -340,6 +453,9 @@ class Browser:
                 opcoes.append(texto)
 
         return opcoes
+    
+    def restartConversation(self):
+        return self.sendMessage("Novo Teste", wait_response=True)
 
 
 browser = Browser()

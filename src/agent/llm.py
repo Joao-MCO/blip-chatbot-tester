@@ -6,6 +6,6 @@ load_dotenv()
 
 llm = ChatOpenAI(
     api_key=os.getenv("OPENAI_API_KEY"),
-    model="gpt-5-nano",
+    model="gpt-5.4-mini",
     temperature=0
 )
