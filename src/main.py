@@ -5,9 +5,6 @@ from agent.tools import carregar_instrucoes
 from services.scrapping import browser
 from services.tasks import parse_instructions
 
-URL = "https://sharkdev.chat.blip.ai/?appKey=cGxheWdyb3VuZGpvYW9tYXJyb2NvczpkMWFlYzZiZS02ZWMwLTQ4N2EtYjcwMi0wYzE4NzVhN2VjOWI=&_gl=1*113ay37*_gcl_au*MTk1MjUzMDM3Ny4xNzgzMzQyNzIx*_ga*MTYzNDg5OTAyLjE3NzU0Nzc4MzQ.*_ga_8GVWK8YMGL*czE3ODM4MjkwNTEkbzIwMSRnMSR0MTc4MzgyOTYxMiRqNTkkbDAkaDY1Njc5NTIwMw.."
-
-
 def main():
     url = input("Insira a URL do Bot: ") if(not URL) else URL
     instrucoes = carregar_instrucoes()
