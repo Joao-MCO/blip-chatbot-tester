@@ -16,7 +16,8 @@ from typing import List, Optional
 
 from PIL import Image, ImageChops
 
-EXTENSOES_SUPORTADAS = [".pdf", ".png", ".jpg", ".jpeg"]
+EXTENSOES_IMAGEM = [".pdf", ".png", ".jpg", ".jpeg"]
+EXTENSOES_SUPORTADAS = EXTENSOES_IMAGEM
 
 # Raiz do projeto (mesmo nível de instrucoes.txt / requirements.txt)
 _RAIZ_PROJETO = os.path.dirname(
@@ -43,7 +44,11 @@ def localizar_arquivo_modelo() -> Optional[str]:
     das extensões suportadas. Retorna o caminho completo se encontrar,
     ou None se não existir nenhum.
     """
-    for ext in EXTENSOES_SUPORTADAS:
+    return _localizar_arquivo_modelo_por_extensao(EXTENSOES_SUPORTADAS)
+
+
+def _localizar_arquivo_modelo_por_extensao(extensoes: list[str]) -> Optional[str]:
+    for ext in extensoes:
         caminho = os.path.join(_RAIZ_PROJETO, f"modelo{ext}")
         if os.path.isfile(caminho):
             return caminho
@@ -159,7 +164,7 @@ def carregar_imagens_modelo() -> List[str]:
 
     Retorna lista vazia se nenhum arquivo "modelo" for encontrado.
     """
-    caminho = localizar_arquivo_modelo()
+    caminho = _localizar_arquivo_modelo_por_extensao(EXTENSOES_IMAGEM)
     if caminho is None:
         return []
 

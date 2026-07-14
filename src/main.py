@@ -19,6 +19,8 @@ def main():
         "current_options": [],
         "bot_messages_seen": 0,
         "conversation_origin": f"Conversa capturada via Selenium na URL: {url}",
+        "awaiting_final_reply": False,
+        "final_reply_received": False,
         "response": "",
         "response_tipo": "",
         "error": False,
@@ -38,6 +40,9 @@ def main():
         conteudo_resultado = resultado.get("summary", "")
         with open("resultado.txt", "w+", encoding="utf-8") as file:
             file.write(conteudo_resultado)
+        conteudo = resultado.get("messages", "")
+        with open("conversa.txt", "w+", encoding="utf-8") as file:
+            file.write("\n".join(conteudo))
 
     except Exception as e:
         conteudo_erro = (

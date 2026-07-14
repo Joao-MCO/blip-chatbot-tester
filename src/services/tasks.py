@@ -1,7 +1,13 @@
+import json
 import re
 import unicodedata
 
+from agent.llm import llm
 from agent.state import Task
+
+
+TASK_TYPES = {"text", "option", "restart", "data"}
+DATA_FIELDS = {"cpf", "telefone", "email", "empresa", "endereco", "nome"}
 
 
 def _normalizar(texto: str) -> str:
@@ -21,112 +27,153 @@ def _task(instruction: str, tipo: str, value: str | None = None, **extra) -> Tas
     return task
 
 
-def _extrair_nome(texto: str) -> str | None:
-    padroes = (
-        r"(?:coloque|use|informe|diga)\s+(?:como\s+)?nome\s+(.+?)(?:[.!\n]|$)",
-        r"nome\s+(?:deve\s+ser|sera)\s+(.+?)(?:[.!\n]|$)",
-    )
-    for padrao in padroes:
-        match = re.search(padrao, texto, flags=re.IGNORECASE)
-        if match:
-            return match.group(1).strip(" \"'")
-    return None
+def _extrair_json(texto: str) -> dict | None:
+    bruto = texto.strip()
+    if bruto.startswith("```"):
+        bruto = bruto.strip("`").strip()
+        if bruto.lower().startswith("json"):
+            bruto = bruto[4:].strip()
+
+    try:
+        dados = json.loads(bruto)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    return dados if isinstance(dados, dict) else None
 
 
-def _extrair_escolha_comentario(trecho: str) -> str | None:
-    normalizado = _normalizar(trecho)
-    if re.search(r"(?:diga|dizendo|responda)\s+nao\s+(?:ao|a|sobre o)\s+coment", normalizado):
-        return "Não"
-    if re.search(r"(?:diga|dizendo|responda)\s+sim\s+(?:ao|a|sobre o)\s+coment", normalizado):
-        return "Sim"
-    return None
+def _normalizar_task(item: dict) -> Task | None:
+    if not isinstance(item, dict):
+        return None
+
+    instruction = str(item.get("instruction", "")).strip()
+    tipo = str(item.get("type", "")).strip().lower()
+    value = item.get("value")
+    field = item.get("field")
+
+    if not instruction or tipo not in TASK_TYPES:
+        return None
+
+    extra = {}
+    if tipo == "data":
+        field = str(field or "").strip().lower()
+        if field not in DATA_FIELDS:
+            return None
+        extra["field"] = field
+
+    if tipo == "restart":
+        value = None
+    elif value is not None:
+        value = str(value).strip()
+        if not value:
+            value = None
+
+    return _task(instruction, tipo, value, **extra)
 
 
-def parse_instructions(text: str) -> list[Task]:
-    """Converte um roteiro em linguagem natural em ações executáveis.
+def _interpretar_com_llm(text: str) -> list[Task]:
+    prompt = f"""
+Voce esta convertendo um roteiro de teste de chatbot em tarefas executaveis.
 
-    Aceita tanto listas iniciadas por ``-`` quanto parágrafos comuns. Para
-    roteiros de avaliação, cada nota forma um cenário independente e uma
-    tarefa de reinício é inserida entre os cenários.
-    """
-    if not text or not text.strip():
+Roteiro:
+{text}
+
+Retorne SOMENTE JSON valido, sem markdown, neste formato:
+
+{{
+  "tasks": [
+    {{
+      "instruction": "acao clara para o usuario simulado",
+      "type": "text|option|data|restart",
+      "value": "texto exato a enviar ou opcao exata a selecionar, ou null",
+      "field": "nome|cpf|telefone|email|empresa|endereco|null"
+    }}
+  ]
+}}
+
+Regras:
+- Converta somente acoes que o usuario simulado deve executar.
+- Nao inclua mensagens esperadas do bot, criterios de validacao, titulos,
+  explicacoes ou observacoes como tarefas.
+- Use "data" quando a acao for informar um dado cadastral. Preencha "field".
+- Use "option" quando a acao for escolher botao, menu, nota, estrela,
+  avaliacao, sim/nao ou alternativa visivel.
+- Use "text" quando a acao for digitar uma mensagem livre.
+- Use "restart" apenas quando o roteiro pedir reinicio de conversa ou novo
+  cenario.
+- Se a instrucao disser "sempre", repita a tarefa nas fases em que ela for
+  necessaria para cumprir o roteiro, mas nao invente fases.
+- Para estrelas, retorne a quantidade como caracteres de estrela em "value".
+  Exemplo: 5 estrelas => "⭐⭐⭐⭐⭐".
+- Para comentarios genericos, gere um texto curto coerente em "value".
+- Preserve acentos, emojis e grafia quando o roteiro trouxer valor literal.
+"""
+
+    resposta = llm.invoke(prompt)
+    dados = _extrair_json(resposta.content)
+    if not dados:
         return []
 
-    nome = _extrair_nome(text)
-    normalizado = _normalizar(text)
-    sempre_nao_ajuda = bool(
-        re.search(r"sempre.+?nao.+?(?:precisa|preciso|ajuda)", normalizado, re.DOTALL)
-    )
+    tasks = dados.get("tasks", [])
+    if not isinstance(tasks, list):
+        return []
 
-    notas = list(
-        re.finditer(r"(?:use|envi(?:e|ando)|d[eê])(?:\s+a\s+op[cç][aã]o\s+de)?\s+(\d)\s+estrelas?", text, re.IGNORECASE)
-    )
+    normalizadas = []
+    for item in tasks:
+        task = _normalizar_task(item)
+        if task:
+            normalizadas.append(task)
 
-    # Roteiro estruturado por cenários de nota.
-    if notas:
-        tasks: list[Task] = []
-        for indice, nota in enumerate(notas):
-            inicio = nota.end()
-            fim = notas[indice + 1].start() if indice + 1 < len(notas) else len(text)
-            trecho = text[inicio:fim]
+    return normalizadas
 
-            # O comando de reinício mantém os dados da sessão no chatbot.
-            # Depois do primeiro cenário ele volta diretamente à pergunta
-            # de continuidade, portanto reenviar o nome deslocaria todo o
-            # restante do roteiro em uma etapa.
-            if nome and indice == 0:
-                tasks.append(_task(f'Informe o nome "{nome}".', "data", nome, field="nome"))
-            if sempre_nao_ajuda:
-                tasks.append(_task("Diga NÃO quando perguntarem se precisa de mais ajuda.", "option", "Não"))
 
-            quantidade = int(nota.group(1))
-            estrelas = "⭐" * quantidade
-            tasks.append(_task(f"Envie {quantidade} estrela(s).", "text", estrelas))
-
-            escolha = _extrair_escolha_comentario(trecho)
-            if escolha:
-                tasks.append(_task(f'Diga "{escolha}" à pergunta sobre comentário.', "option", escolha))
-
-            if escolha == "Sim" and re.search(r"comente|reclama[cç][aã]o", trecho, re.IGNORECASE):
-                tasks.append(
-                    _task(
-                        "Comente uma reclamação genérica sobre um atendimento humano.",
-                        "text",
-                        "O atendimento humano demorou e não resolveu meu problema.",
-                    )
-                )
-
-            if indice + 1 < len(notas):
-                tasks.append(
-                    _task(
-                        "Ao receber a mensagem final, reinicie a conversa para o próximo cenário.",
-                        "restart",
-                    )
-                )
-        return tasks
-
-    # Compatibilidade com roteiros simples: uma ação por linha/list item.
-    tasks = []
+def _fallback_parse(text: str) -> list[Task]:
+    tasks: list[Task] = []
     for linha in text.splitlines():
         instruction = linha.strip().lstrip("-").strip()
         if not instruction or instruction.startswith("#"):
             continue
 
-        linha_normalizada = _normalizar(instruction)
-        tipo = "text"
-        extra = {}
-        valor = None
+        normalizada = _normalizar(instruction)
+        if "ultima mensagem" in normalizada or "mensagem final" in normalizada:
+            continue
 
-        if "reinici" in linha_normalizada:
-            tipo = "restart"
-        elif "nome" in linha_normalizada:
-            tipo = "data"
-            extra["field"] = "nome"
-            valor = _extrair_nome(instruction)
-        elif re.search(r"\b(sim|nao)\b", linha_normalizada):
-            tipo = "option"
-            valor = "Não" if re.search(r"\bnao\b", linha_normalizada) else "Sim"
+        if "reinici" in normalizada:
+            tasks.append(_task(instruction, "restart"))
+            continue
 
-        tasks.append(_task(instruction, tipo, valor, **extra))
+        nome = re.search(r"(?:nome|como nome)\s+(.+?)(?:[.!\n]|$)", instruction, re.IGNORECASE)
+        if nome:
+            tasks.append(_task(instruction, "data", nome.group(1).strip(" \"'"), field="nome"))
+            continue
+
+        estrelas = re.search(r"(\d)\s+estrelas?", instruction, re.IGNORECASE)
+        if estrelas:
+            tasks.append(_task(instruction, "option", "⭐" * int(estrelas.group(1))))
+            continue
+
+        if re.search(r"\b(sim|n[aã]o)\b", normalizada):
+            valor = "Não" if re.search(r"\bnao\b", normalizada) else "Sim"
+            tasks.append(_task(instruction, "option", valor))
+            continue
+
+        tasks.append(_task(instruction, "text"))
 
     return tasks
+
+
+def parse_instructions(text: str) -> list[Task]:
+    """Converte um roteiro em linguagem natural em acoes executaveis."""
+    if not text or not text.strip():
+        return []
+
+    try:
+        tasks = _interpretar_com_llm(text)
+    except Exception as e:
+        print(f"[tasks] falha ao interpretar instrucoes com LLM: {e}")
+        tasks = []
+
+    if tasks:
+        return tasks
+
+    return _fallback_parse(text)

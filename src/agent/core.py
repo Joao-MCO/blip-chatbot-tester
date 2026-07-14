@@ -83,3 +83,7 @@ class Agent:
         )
 
         self.workflow = graph.compile()
+        graph_png = self.workflow.get_graph().draw_mermaid_png()
+
+        with open("graph.png", "wb") as f:
+            f.write(graph_png)

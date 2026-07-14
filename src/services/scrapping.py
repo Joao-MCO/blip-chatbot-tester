@@ -372,15 +372,16 @@ class Browser:
         bolha do bot, se houver).
         """
         mensagens = []
+        try:
+            site = BeautifulSoup(self.__browser.page_source, "html.parser")
+        except WebDriverException:
+            return mensagens
 
-        bubbles = self.__browser.find_elements(By.CSS_SELECTOR, BUBBLE_SELECTOR)
+        bubbles = site.select(BUBBLE_SELECTOR)
 
         for bubble in bubbles:
-            try:
-                texto = bubble.text.strip()
-                classes = bubble.get_attribute("class")
-            except StaleElementReferenceException:
-                continue
+            classes = bubble.get("class", [])
+            texto = bubble.get_text("\n", strip=True)
 
             if not texto:
                 continue
@@ -418,41 +419,30 @@ class Browser:
         que contenha um slideshow de opcoes (em vez de "blip-container",
         que pode nao englobar o slideshow), com um fallback mais amplo.
         """
-        candidatos_xpath = [
-            "./ancestor::div[contains(@class, 'blip-relative')][1]",
-            "./ancestor::*[contains(@class, 'left') or contains(@class, 'right')]"
-            "[.//div[contains(@class, 'slideshow-track') and contains(@class, 'options')]][1]",
-            "./ancestor::div[position()<=6][.//div[contains(@class,'slideshow-track')]][1]",
-        ]
-
-        option_elements = []
-        for xpath in candidatos_xpath:
-            try:
-                container = bubble.find_element(By.XPATH, xpath)
-            except (NoSuchElementException, StaleElementReferenceException):
-                continue
-
-            try:
-                found = container.find_elements(
-                    By.CSS_SELECTOR, OPTIONS_CONTAINER_SELECTOR
-                )
-            except StaleElementReferenceException:
-                continue
-
-            if found:
-                option_elements = found
+        # Procurar até o primeiro bloco estrutural que ainda contenha
+        # somente esta bolha. Subir até o container geral da conversa fazia
+        # todas as opções antigas serem atribuídas à mensagem atual.
+        for container in bubble.parents:
+            if getattr(container, "name", None) in {"body", "html"}:
                 break
-
-        opcoes = []
-        for opt in option_elements:
             try:
-                texto = opt.text.strip()
-            except StaleElementReferenceException:
+                bolhas_no_bloco = container.select(BUBBLE_SELECTOR)
+                if len(bolhas_no_bloco) > 1:
+                    break
+                encontrados = container.select(OPTIONS_CONTAINER_SELECTOR)
+            except Exception:
                 continue
-            if texto:
-                opcoes.append(texto)
 
-        return opcoes
+            if encontrados:
+                opcoes = []
+                for opt in encontrados:
+                    texto = opt.get_text("\n", strip=True)
+                    if texto:
+                        opcoes.append(texto)
+                if opcoes:
+                    return opcoes
+
+        return []
     
     def restartConversation(self):
         return self.sendMessage("Novo Teste", wait_response=True)

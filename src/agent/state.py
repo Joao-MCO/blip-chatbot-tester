@@ -23,6 +23,8 @@ class State(TypedDict):
     current_options: List[str]     # opções de menu (se houver) na última msg do bot
     bot_messages_seen: int         # quantas mensagens do bot já foram registradas
     conversation_origin: str
+    awaiting_final_reply: bool
+    final_reply_received: bool
     response: str
     response_tipo: str             # "opcao" | "texto" | "aguardar"
     error: bool
