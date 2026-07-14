@@ -45,10 +45,23 @@ class Agent:
             "read_messages"
         )
 
-        graph.add_edge(
+        graph.add_conditional_edges(
             "read_messages",
-            "generate_response"
+            should_finish,
+            {
+                "read_messages": "generate_response",
+                "summary": "summary",
+            },
         )
+        # NOTA: reaproveitamos should_finish aqui -- ele retorna
+        # "read_messages" (=> segue o fluxo normal, vai para
+        # generate_response) ou "summary" (=> encerra sem gerar nem
+        # enviar mais nenhuma resposta). Isso é necessário porque a
+        # salvaguarda de fim de conversa em read_messages (detectar que
+        # o bot reiniciou o fluxo) precisa interromper o ciclo ANTES de
+        # generate_response/send_message rodarem de novo -- caso
+        # contrário o agente ainda gera e envia uma resposta a mais
+        # para o bot antes do teste realmente parar.
 
         graph.add_edge(
             "generate_response",

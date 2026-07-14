@@ -209,4 +209,5 @@ __marimo__/
 test.*
 secrets.toml
 /dados
-debug.html/
+debug_html/
+instrucoes.txt

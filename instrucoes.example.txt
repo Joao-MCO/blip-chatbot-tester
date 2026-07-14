@@ -1,0 +1,46 @@
+# Como usar
+# ---------
+# 1. Copie este arquivo para "instrucoes.txt" (na raiz do projeto,
+#    mesmo lugar deste arquivo).
+# 2. Escreva, em texto livre, o objetivo do teste que você quer que o
+#    agente siga. O agente vai ler isso a cada resposta que gerar.
+# 3. Se "instrucoes.txt" não existir ou estiver vazio, o agente se
+#    comporta de forma genérica (como um usuário qualquer testando o
+#    fluxo, sem objetivo específico) -- é o comportamento padrão.
+# 4. Linhas começando com "#" são só comentários e podem ser apagadas;
+#    elas não têm efeito especial, é só uma convenção deste exemplo.
+
+# ------------------------------------------------------------------
+# Exemplo 1: testar um fluxo específico
+# ------------------------------------------------------------------
+# Teste o fluxo de abertura de chamado de suporte técnico.
+# Quando o bot pedir para descrever o problema, diga que "o sistema
+# trava ao gerar relatórios em PDF".
+# Se o bot perguntar se deseja anexar um arquivo, recuse.
+# Se perguntarem se pode ajudar em algo mais, diga que não.
+
+# ------------------------------------------------------------------
+# Exemplo 2: testar um cenário de erro/edge case
+# ------------------------------------------------------------------
+# Teste o fluxo de cancelamento de pedido. Ao informar o motivo do
+# cancelamento, diga "mudei de ideia". Se o bot oferecer um desconto
+# para não cancelar, recuse educadamente e insista no cancelamento.
+
+# ------------------------------------------------------------------
+# Exemplo 3: apenas dar um contexto/persona, sem roteiro rígido
+# ------------------------------------------------------------------
+# Você é um cliente novo, meio confuso sobre como o atendimento
+# funciona. Faça perguntas genéricas antes de seguir qualquer fluxo
+# oferecido pelo bot.
+
+# ------------------------------------------------------------------
+# Exemplo 4: especificar um valor exato para um dado cadastral
+# ------------------------------------------------------------------
+# Teste o fluxo de "Saber mais" usando como telefone o número
+# 5535998768686. Ao ser perguntado se quer algo mais, diga não.
+#
+# Se o roteiro especificar um valor exato para um campo (CPF, telefone,
+# email, nome, empresa ou endereço), o agente usa esse valor literal em
+# vez de gerar um dado fictício aleatório. Se não especificar, um valor
+# fictício é gerado automaticamente como antes.
+

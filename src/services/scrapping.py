@@ -1,3 +1,4 @@
+import time
 from datetime import datetime
 from typing import List, Dict, Optional
 
@@ -8,6 +9,7 @@ from selenium.common.exceptions import (
     StaleElementReferenceException,
     ElementClickInterceptedException,
     NoSuchElementException,
+    WebDriverException,
 )
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
@@ -17,11 +19,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 
-# Seletor das bolhas de mensagem (bot = left, usuário = right)
 BUBBLE_SELECTOR = ".bubble.left, .bubble.right"
 
-# Seletor das opções/botões de menu que o Blip renderiza logo abaixo
-# de uma bolha do bot (ex: "select", "quick reply", etc.)
 OPTIONS_CONTAINER_SELECTOR = ".slideshow-track.options ul.item-list li"
 
 
@@ -35,17 +34,14 @@ class Browser:
         self.__browser = webdriver.Chrome(options=self.__options)
         self.__browser.get(url)
 
-        # Espera o chat carregar (textarea disponível) em vez de sleep fixo
         self._wait_for(
             EC.presence_of_element_located((By.ID, "msg-textarea")),
             timeout=timeout,
         )
-        # A primeira mensagem enviada identifica que essa conversa é um
-        # teste automatizado, com a data do dia -- útil para rastrear
-        # esses atendimentos de teste no painel do Blip e diferenciá-los
-        # de conversas reais de usuários.
+        time.sleep(5)
         data_hoje = datetime.now().strftime("%d/%m/%Y")
         self.sendMessage(f"ChatBot Tester - {data_hoje}")
+        time.sleep(5)
 
     def getBrowser(self) -> WebDriver:
         return self.__browser
@@ -86,16 +82,39 @@ class Browser:
         acharia que uma nova mensagem já chegou e leria o DOM cedo
         demais, pegando a mensagem ANTERIOR (a última com texto) em vez
         de esperar a mensagem nova terminar de aparecer.
+
+        Também tolera falhas transitórias de conexão com o
+        ChromeDriver (ex: "ConnectionResetError" observado em testes
+        reais) fazendo até 2 tentativas extras antes de propagar o
+        erro -- uma falha pontual de rede local não deveria derrubar o
+        teste inteiro.
         """
-        bubbles = self.__browser.find_elements(By.CSS_SELECTOR, BUBBLE_SELECTOR)
-        count = 0
-        for b in bubbles:
+        tentativas = 3
+        ultimo_erro = None
+
+        for _ in range(tentativas):
             try:
-                if b.text.strip():
-                    count += 1
-            except StaleElementReferenceException:
-                continue
-        return count
+                bubbles = self.__browser.find_elements(By.CSS_SELECTOR, BUBBLE_SELECTOR)
+                count = 0
+                for b in bubbles:
+                    try:
+                        if b.text.strip():
+                            count += 1
+                    except StaleElementReferenceException:
+                        continue
+                return count
+            except WebDriverException as e:
+                # erro de conexão com o ChromeDriver (ex: processo do
+                # Chrome travou/morreu, ou reset de conexão local) --
+                # espera um instante e tenta de novo antes de desistir
+                ultimo_erro = e
+                time.sleep(1)
+
+        # se mesmo assim continuar falhando, propaga o erro para que
+        # a camada de cima (nodes.py) possa encerrar o teste de forma
+        # controlada em vez de deixar o traceback cru derrubar o
+        # processo no meio de uma espera do Selenium
+        raise ultimo_erro
 
     def waitForNewMessage(self, previous_count: int, timeout: int = 15) -> bool:
         """
@@ -122,14 +141,8 @@ class Browser:
         except TimeoutException:
             return False
 
-        # folga extra: garante que, mesmo que a bolha tenha acabado de
-        # ganhar texto agora mesmo, o restante do conteúdo (e um
-        # eventual slideshow de opções associado) tenha tempo de
-        # aparecer também.
         self._wait_for_dom_stable(timeout=4)
 
-        # espera extra e curta especificamente pelo container de opções,
-        # sem falhar se não houver nenhum (mensagem sem menu é normal)
         try:
             self._wait_for(
                 EC.presence_of_element_located(
@@ -210,7 +223,6 @@ class Browser:
                 break
 
         if alvo is None:
-            # fallback: tenta por correspondência parcial (case-insensitive)
             for opt in options:
                 try:
                     texto = opt.text.strip().lower()
@@ -227,7 +239,6 @@ class Browser:
             self.__browser.execute_script("arguments[0].scrollIntoView({block: 'center'});", alvo)
             alvo.click()
         except ElementClickInterceptedException:
-            # alguns temas cobrem o <li> com overlay; clique via JS resolve
             self.__browser.execute_script("arguments[0].click();", alvo)
         except StaleElementReferenceException:
             return False
@@ -272,16 +283,6 @@ class Browser:
 
             mensagens.append(item)
 
-        # NOTA: NÃO usamos mais um fallback "global" que pega qualquer
-        # .slideshow-track.options visível na página. O Blip NÃO remove
-        # o menu de opções do DOM depois que o usuário clica -- ele
-        # continua lá (só marcado como já respondido). Um fallback
-        # global acabava "vazando" as opções de um menu ANTIGO/já
-        # respondido para uma mensagem nova do bot que não tinha menu
-        # nenhum, fazendo o agente tentar responder com uma opção que
-        # não existe mais naquele contexto. A associação estrutural via
-        # "blip-relative" (em _read_options_for_bubble) é confiável o
-        # suficiente sozinha e evita esse falso positivo.
         return mensagens
 
     def _read_options_for_bubble(self, bubble) -> List[str]:
@@ -304,18 +305,10 @@ class Browser:
         que contenha um slideshow de opcoes (em vez de "blip-container",
         que pode nao englobar o slideshow), com um fallback mais amplo.
         """
-        # 'blip-relative' e o container mais estreito que envolve UMA
-        # unica mensagem (bolha + eventual slideshow de opcoes + avatar).
-        # Containers mais largos (ex: blip-message-group) podem agrupar
-        # VARIAS mensagens do bot em sequencia e vazar opcoes de uma
-        # bolha para outra que nao tem relacao com elas.
         candidatos_xpath = [
             "./ancestor::div[contains(@class, 'blip-relative')][1]",
             "./ancestor::*[contains(@class, 'left') or contains(@class, 'right')]"
             "[.//div[contains(@class, 'slideshow-track') and contains(@class, 'options')]][1]",
-            # fallback mais tolerante: sobe alguns níveis genéricos e
-            # procura o slideshow em qualquer lugar dentro do bloco --
-            # útil se o tema do Blip mudar a estrutura de classes
             "./ancestor::div[position()<=6][.//div[contains(@class,'slideshow-track')]][1]",
         ]
 
